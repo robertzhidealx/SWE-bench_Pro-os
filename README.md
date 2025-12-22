@@ -1,3 +1,5 @@
+See [PARITY_README.md](PARITY_README.md) for details on the parity experiment between SWE-bench Pro and the Harbor adaptation.
+
 ## SWE-Bench Pro
 
 Code and data for the following works:
