@@ -15,19 +15,19 @@ The parity experiment pipeline follows the exact steps required by SWE-bench Pro
 1. Run Codex through the 100 sampled tasks:
 
 ```bash
-python run_codex.py \
-  --model openai/gpt-5-mini-2025-08-07 \
+uv run run_codex.py \
+  --model gpt-5-mini-2025-08-07 \
   --instance_ids_file sampled_subset.txt \
   --output_dir results/swebenchpro-trial \
   --mode daytona \
   --max_concurrent 10 \
-  --num_retries 3 \
+  --num_retries 3
 ```
 
 2. Gather patches from the Codex outputs into one JSON file:
 
 ```bash
-python helper_code/gather_patches.py \
+uv run helper_code/gather_patches.py \
   --directory results/swebenchpro-trial \
   --prefix swebenchpro-trial \
   --output results/swebenchpro-trial-patches.json
@@ -36,8 +36,8 @@ python helper_code/gather_patches.py \
 3. Evaluate the gathered patches against SWE-bench Pro tests:
 
 ```bash
-python swe_bench_pro_eval.py \
-  --raw_sample_path swebenchpro_raw.csv \ 
+uv run swe_bench_pro_eval.py \
+  --raw_sample_path swebenchpro_raw.csv \
   --patch_path results/swebenchpro-trial-patches.json \
   --output_dir results/swebenchpro-trial-eval \
   --dockerhub_username jefzda \

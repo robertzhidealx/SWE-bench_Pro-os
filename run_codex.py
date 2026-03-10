@@ -38,6 +38,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 # Add parent directory to path to import helper_code
 sys.path.insert(0, str(Path(__file__).parent))
 from helper_code.image_uri import get_dockerhub_image_uri
+from helper_code.create_problem_statement import create_problem_statement
 
 from datasets import load_dataset
 from daytona import (
@@ -64,20 +65,7 @@ def run_command(cmd: list[str], timeout: Optional[int] = None, **kwargs) -> subp
 
 def format_problem_description(instance: dict, repo_full_name: str, base_commit: str, instance_id: str) -> str:
     """Format problem description with metadata."""
-    problem_statement = instance.get("problem_statement", "")
-    repo_language = instance.get("repo_language", "")
-    
-    return f"""# Task
-
-{problem_statement}
-
----
-
-**Repo:** `{repo_full_name}`
-**Base commit:** `{base_commit}`
-**Instance ID:** `{instance_id}`
-**Language:** `{repo_language}`
-"""
+    return create_problem_statement(instance)
 
 
 class DockerExecutor:
@@ -93,6 +81,7 @@ class DockerExecutor:
         model: str,
         output_dir: Path,
         timeout: int = 3000,
+        dockerhub_username: str = "",
         status_callback=None,
     ) -> tuple[bool, Optional[str], Optional[str]]:
         """Run Codex on a single instance using Docker."""
@@ -117,8 +106,7 @@ class DockerExecutor:
         repo_full_name = f"{repo_base}/{repo_name}"
         docker_image = get_dockerhub_image_uri(instance_id, self.dockerhub_username, repo_full_name)
         base_commit = instance.get("base_commit", "")
-        before_repo_set_cmd = instance.get("before_repo_set_cmd", "").strip()
-        
+
         # Format problem description with metadata
         problem_description = format_problem_description(instance, repo_full_name, base_commit, instance_id)
         
@@ -153,6 +141,7 @@ class DockerExecutor:
             "-v", f"{work_dir.absolute()}:/workspace",
             "-w", "/workspace",
             "-e", f"OPENAI_API_KEY={os.environ.get('OPENAI_API_KEY', '')}",
+            "-e", f"OPENAI_BASE_URL={os.environ.get('OPENAI_BASE_URL', '')}",
             docker_image,
             "sleep", "infinity"
         ]
@@ -202,60 +191,41 @@ class DockerExecutor:
             if verify_result.returncode != 0:
                 return False, None, f"Failed to verify repo: {verify_result.stderr}"
             
-            # Run before_repo_set_cmd if present (typically used to checkout specific test files)
-            if before_repo_set_cmd:
-                update_status("running before_repo_set_cmd...")
-                # Split by newlines, strip each line, filter empty lines, then join with && (Harbor adapter pattern)
-                before_cmd_lines = [line.strip() for line in before_repo_set_cmd.split("\n") if line.strip()]
-                if before_cmd_lines:
-                    before_cmd_script = " && ".join(before_cmd_lines)
-                    prep_result = await docker_exec(
-                        f"set -e && cd /app && {before_cmd_script}",
-                        timeout_sec=30
-                    )
-                    if prep_result.returncode != 0:
-                        return False, None, f"Failed to run before_repo_set_cmd: {prep_result.stderr}"
-            
+            # Only reset to base commit at runtime. Do NOT run
+            # before_repo_set_cmd here — its last line checks out gold test files
+            # from the solution commit, leaking test information to the agent.
+            # The full before_repo_set_cmd runs at verification time in test.sh.
+            update_status("resetting to base commit...")
+            reset_result = await docker_exec(
+                f"set -e && cd /app && git reset --hard {base_commit} && git clean -fd && git checkout {base_commit}",
+                timeout_sec=30
+            )
+            if reset_result.returncode != 0:
+                return False, None, f"Failed to reset to base commit: {reset_result.stderr}"
+
             update_status("installing codex...")
             install_result = await docker_exec(
                 """
                 set -euo pipefail
-                
-                # Check if codex is already installed
+
                 if command -v codex &> /dev/null; then
                     echo "Codex already installed"
                     exit 0
                 fi
-                
-                # Install nvm and Node.js
-                if [ ! -d "$HOME/.nvm" ]; then
-                    if ! command -v curl &> /dev/null; then
-                        if command -v apt-get &> /dev/null; then
-                            apt-get update -qq && apt-get install -y -qq curl 2>&1
-                        elif command -v wget &> /dev/null; then
-                            wget -qO- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
-                            export NVM_DIR="$HOME/.nvm"
-                            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-                        else
-                            echo "ERROR: Neither curl nor wget available" >&2
-                            exit 1
-                        fi
-                    fi
-                    if command -v curl &> /dev/null && [ ! -d "$HOME/.nvm" ]; then
-                        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
-                    fi
-                fi
-                
+
+                apt-get update -qq && apt-get install -y -qq curl 2>&1
+
                 export NVM_DIR="$HOME/.nvm"
+                curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
                 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-                
-                nvm install 22 2>&1 || true
-                nvm use 22 2>&1 || true
-                
-                # Install Codex CLI
+
+                nvm install 22 2>&1
                 npm install -g @openai/codex@latest 2>&1
-                
-                echo "Codex installation complete"
+
+                # Symlink to /usr/local/bin so codex is always on PATH
+                ln -sf "$(which codex)" /usr/local/bin/codex
+
+                codex --version
                 """,
                 timeout_sec=300
             )
@@ -263,41 +233,43 @@ class DockerExecutor:
                 return False, None, f"Failed to install Codex: {install_result.stderr}"
             
             update_status("running codex...")
-            
-            # Write formatted problem description to a file
-            problem_file = work_dir / "problem.txt"
-            problem_file.write_text(problem_description)
-            
+
             model_name = model.split("/")[-1]
-            
-            agent_result = await docker_exec(
+            escaped_instruction = shlex.quote(problem_description)
+            codex_home = "/workspace/.codex"
+
+            # Setup: write auth.json (Harbor pattern)
+            await docker_exec(
                 f"""
-                set -euo pipefail
-                cd /app
-                
-                export NVM_DIR="$HOME/.nvm"
-                [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-                nvm use 22 2>&1 || true
-                
-                mkdir -p /workspace/.codex
-                cat > /workspace/.codex/auth.json <<EOF
+                set -e
+                mkdir -p /tmp/codex-secrets
+                cat >/tmp/codex-secrets/auth.json <<EOF
 {{
   "OPENAI_API_KEY": "$OPENAI_API_KEY"
 }}
 EOF
-                
-                export CODEX_HOME=/workspace/.codex
-                
-                timeout 3000 codex exec \
+                mkdir -p {codex_home}
+                ln -sf /tmp/codex-secrets/auth.json {codex_home}/auth.json
+                """,
+                timeout_sec=10
+            )
+
+            # Run codex (Harbor pattern)
+            agent_result = await docker_exec(
+                f"""
+                cd /app
+                export CODEX_HOME={codex_home}
+                [ -s ~/.nvm/nvm.sh ] && . ~/.nvm/nvm.sh
+                codex exec \
                   --dangerously-bypass-approvals-and-sandbox \
                   --skip-git-repo-check \
                   --model {model_name} \
                   --json \
+                  --enable unified_exec \
+                  -c model_reasoning_effort=high \
                   -- \
-                  "$(cat /workspace/problem.txt)" \
+                  {escaped_instruction} \
                   2>&1 </dev/null | tee /workspace/agent.log
-                
-                rm -rf /workspace/.codex/auth.json
                 """,
                 timeout_sec=3060  # 3000s for codex + 60s buffer
             )
@@ -424,21 +396,28 @@ class DaytonaExecutor:
         command: str,
         cwd: str = "/app",
         timeout_sec: int = 3000,
+        env: dict[str, str] | None = None,
     ):
         """Execute command in sandbox (similar to Harbor's DaytonaEnvironment.exec)."""
         session_id = str(uuid4())
         try:
             await sandbox.process.create_session(session_id)
-            
-            full_command = f"bash -ic {shlex.quote(command)}"
-            
+
+            # Build env prefix to inject env vars at the process level (like Harbor)
+            env_prefix = ""
+            if env:
+                env_parts = [f"export {k}={shlex.quote(v)}" for k, v in env.items()]
+                env_prefix = " && ".join(env_parts) + " && "
+
+            full_command = f"bash -lc {shlex.quote(command)}"
+
             if timeout_sec:
                 full_command = f"timeout {timeout_sec} {full_command}"
-            
+
             response = await sandbox.process.execute_session_command(
                 session_id,
                 SessionExecuteRequest(
-                    command=f"cd {cwd} && {full_command}",
+                    command=f"{env_prefix}cd {cwd} && {full_command}",
                     run_async=True,
                 ),
                 timeout=timeout_sec,
@@ -491,14 +470,13 @@ class DaytonaExecutor:
         repo_full_name = f"{repo_base}/{repo_name}"
         docker_image = get_dockerhub_image_uri(instance_id, dockerhub_username, repo_full_name)
         base_commit = instance.get("base_commit", "")
-        before_repo_set_cmd = instance.get("before_repo_set_cmd", "").strip()
-        
+
         # Format problem description with metadata
         problem_description = format_problem_description(instance, repo_full_name, base_commit, instance_id)
-        
+
         work_dir = instance_dir / "work"
         work_dir.mkdir(exist_ok=True)
-        
+
         # Create dedicated client and sandbox for this instance
         client = None
         sandbox = None
@@ -519,64 +497,42 @@ class DaytonaExecutor:
             if verify_result["return_code"] != 0:
                 return False, None, f"Failed to verify repo: {verify_result['stderr']}"
             
-            # Run before_repo_set_cmd if present (typically used to checkout specific test files)
-            if before_repo_set_cmd:
-                update_status("running before_repo_set_cmd...")
-                # Split by newlines, strip each line, filter empty lines, then join with && (Harbor adapter pattern)
-                before_cmd_lines = [line.strip() for line in before_repo_set_cmd.split("\n") if line.strip()]
-                if before_cmd_lines:
-                    before_cmd_script = " && ".join(before_cmd_lines)
-                    prep_result = await self.exec(
-                        sandbox,
-                        f"set -e && cd /app && {before_cmd_script}",
-                        cwd="/app",
-                        timeout_sec=30
-                    )
-                    if prep_result["return_code"] != 0:
-                        return False, None, f"Failed to run before_repo_set_cmd: {prep_result['stderr']}"
-            
+            # Only reset to base commit at runtime. Do NOT run
+            # before_repo_set_cmd here — its last line checks out gold test files
+            # from the solution commit, leaking test information to the agent.
+            # The full before_repo_set_cmd runs at verification time in test.sh.
+            update_status("resetting to base commit...")
+            reset_result = await self.exec(
+                sandbox,
+                f"set -e && git reset --hard {base_commit} && git clean -fd && git checkout {base_commit}",
+                cwd="/app",
+                timeout_sec=30
+            )
+            if reset_result["return_code"] != 0:
+                return False, None, f"Failed to reset to base commit: {reset_result['stderr']}"
+
             update_status("installing codex...")
             install_script = """
             set -e
-            
+
             if command -v codex &> /dev/null; then
                 echo "Codex already installed"
                 exit 0
             fi
-            
-            # Ensure curl is available
-            if ! command -v curl &> /dev/null; then
-                if command -v apt-get &> /dev/null; then
-                    apt-get update -qq && apt-get install -y -qq curl 2>&1
-                elif command -v yum &> /dev/null; then
-                    yum install -y curl 2>&1
-                elif command -v apk &> /dev/null; then
-                    apk add --no-cache curl 2>&1
-                elif command -v wget &> /dev/null; then
-                    echo "Using wget as fallback for curl"
-                    # wget can be used as fallback but nvm needs curl
-                    wget -qO- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
-                    export NVM_DIR="$HOME/.nvm"
-                    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-                else
-                    echo "ERROR: Neither curl nor wget available and cannot install" >&2
-                    exit 1
-                fi
-            fi
-            
-            # Install nvm and Node.js
-            if [ ! -d "$HOME/.nvm" ] && command -v curl &> /dev/null; then
-                curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash || true
-            fi
-            
+
+            apt-get update -qq && apt-get install -y -qq curl 2>&1
+
             export NVM_DIR="$HOME/.nvm"
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
             [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-            
-            nvm install 22 2>&1 || true
-            nvm use 22 2>&1 || true
-            
+
+            nvm install 22 2>&1
             npm install -g @openai/codex@latest 2>&1
-            echo "Codex installation complete"
+
+            # Symlink to /usr/local/bin so codex is always on PATH
+            ln -sf "$(which codex)" /usr/local/bin/codex
+
+            codex --version
             """
             
             install_result = await self.exec(
@@ -586,45 +542,62 @@ class DaytonaExecutor:
                 timeout_sec=300
             )
             if install_result["return_code"] != 0:
-                return False, None, f"Failed to install Codex: {install_result['stderr']}"
-            
-            # Upload formatted problem description
-            problem_file = work_dir / "problem.txt"
-            problem_file.write_text(problem_description)
-            await sandbox.fs.upload_file(str(problem_file), "/tmp/problem.txt")
-            
+                return False, None, f"Failed to install Codex.\nstdout: {install_result['stdout'][-1000:]}\nstderr: {install_result['stderr'][-1000:]}"
+
             update_status("running codex...")
             model_name = model.split("/")[-1]
             
-            agent_script = f"""
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-            nvm use 22 || true
-            
-            mkdir -p /tmp/.codex
-            cat > /tmp/.codex/auth.json <<EOF
+            # Build env dict matching Harbor's codex agent pattern
+            codex_home = "/logs/agent"
+            agent_env = {
+                "OPENAI_API_KEY": os.environ.get('OPENAI_API_KEY', ''),
+                "CODEX_HOME": codex_home,
+            }
+            openai_base_url = os.environ.get('OPENAI_BASE_URL', '')
+            if openai_base_url:
+                agent_env["OPENAI_BASE_URL"] = openai_base_url
+
+            # Setup command: write auth.json (Harbor pattern)
+            setup_script = f"""
+mkdir -p /tmp/codex-secrets
+cat >/tmp/codex-secrets/auth.json <<EOF
 {{
-  "OPENAI_API_KEY": "{os.environ.get('OPENAI_API_KEY', '')}"
+  "OPENAI_API_KEY": "$OPENAI_API_KEY"
 }}
 EOF
-            
-            export CODEX_HOME=/tmp/.codex
-            
-            timeout 3000 codex exec \
-              --dangerously-bypass-approvals-and-sandbox \
-              --skip-git-repo-check \
-              --model {model_name} \
-              --json \
-              -- \
-              "$(cat /tmp/problem.txt)" \
-              2>&1
+mkdir -p {codex_home}
+ln -sf /tmp/codex-secrets/auth.json {codex_home}/auth.json
             """
-            
+            await self.exec(
+                sandbox,
+                setup_script,
+                cwd="/app",
+                timeout_sec=10,
+                env=agent_env,
+            )
+
+            # Run codex (Harbor pattern)
+            escaped_instruction = shlex.quote(problem_description)
+            agent_script = (
+                "[ -s ~/.nvm/nvm.sh ] && . ~/.nvm/nvm.sh; "
+                "codex exec "
+                "--dangerously-bypass-approvals-and-sandbox "
+                "--skip-git-repo-check "
+                f"--model {model_name} "
+                "--json "
+                "--enable unified_exec "
+                "-c model_reasoning_effort=high "
+                "-- "
+                f"{escaped_instruction} "
+                "2>&1 </dev/null"
+            )
+
             agent_result = await self.exec(
                 sandbox,
                 agent_script,
                 cwd="/app",
-                timeout_sec=3060  # 3000s for codex + 60s buffer
+                timeout_sec=3060,  # 3000s for codex + 60s buffer
+                env=agent_env,
             )
             
             (work_dir / "agent_stdout.txt").write_text(agent_result["stdout"])
@@ -955,7 +928,7 @@ async def main_async():
     
     args = parser.parse_args()
     
-    load_dotenv()
+    load_dotenv(override=True)
     
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
