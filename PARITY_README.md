@@ -12,7 +12,7 @@ The parity experiment pipeline follows the exact steps required by SWE-bench Pro
 
 ## Pipeline
 
-1. Run Codex through the 100 sampled tasks:
+1. Run Codex through the 100 sampled tasks (or a set of 10 sampled tasks in [sampled_subset_10.txt](sampled_subset_10.txt)):
 
 ```bash
 uv run run_codex.py \

@@ -142,6 +142,7 @@ class DockerExecutor:
             "-w", "/workspace",
             "-e", f"OPENAI_API_KEY={os.environ.get('OPENAI_API_KEY', '')}",
             "-e", f"OPENAI_BASE_URL={os.environ.get('OPENAI_BASE_URL', '')}",
+            "-e", "PYTHONPATH=/app/lib:/app",
             docker_image,
             "sleep", "infinity"
         ]
@@ -282,7 +283,7 @@ EOF
                 """
                 set -euo pipefail
                 cd /app
-                git diff HEAD > /workspace/patch.diff
+                git add -N . && git diff HEAD > /workspace/patch.diff
                 """,
                 timeout_sec=30
             )
@@ -552,6 +553,7 @@ class DaytonaExecutor:
             agent_env = {
                 "OPENAI_API_KEY": os.environ.get('OPENAI_API_KEY', ''),
                 "CODEX_HOME": codex_home,
+                "PYTHONPATH": "/app/lib:/app",
             }
             openai_base_url = os.environ.get('OPENAI_BASE_URL', '')
             if openai_base_url:
@@ -606,7 +608,7 @@ ln -sf /tmp/codex-secrets/auth.json {codex_home}/auth.json
             update_status("generating patch...")
             patch_result = await self.exec(
                 sandbox,
-                "git diff HEAD",
+                "git add -N . && git diff HEAD",
                 cwd="/app",
                 timeout_sec=30
             )
